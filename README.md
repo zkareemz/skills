@@ -1,4 +1,4 @@
-# zkareemz-skills
+# @zkareemz/skills
 
 A collection of agent skills for coding harnesses. The first skill is
 **`pi-delegate`**: offload implementation work from your host agent (Claude Code,
@@ -13,11 +13,11 @@ leaving your session.
 Skills are installed with [skills.sh](https://skills.sh):
 
 ```bash
-npx skills add zkareemz-skills
+npx skills add zkareemz/skills
 ```
 
 Pick `pi-delegate` and your target agent when prompted. The engine itself is run
-on demand via `npx -y zkareemz-skills delegate …` (no separate install).
+on demand via `npx -y @zkareemz/skills delegate …` (no separate install).
 
 **Prerequisites:** [`pi`](https://pi.dev) installed and authenticated on your PATH.
 
@@ -36,20 +36,20 @@ GET /health returns 200 with {status:"ok"}.
 EOF
 
 # 2. Start a background job (prints a job_id immediately)
-npx -y zkareemz-skills delegate run brief.md
+npx -y @zkareemz/skills delegate run brief.md
 
 # 3. Poll until done (returns within a safe budget; call again if still running)
-npx -y zkareemz-skills delegate wait <job_id>
+npx -y @zkareemz/skills delegate wait <job_id>
 
 # 4. Read the compact result / drill down
-npx -y zkareemz-skills delegate result <job_id>
-npx -y zkareemz-skills delegate logs <job_id>
+npx -y @zkareemz/skills delegate result <job_id>
+npx -y @zkareemz/skills delegate logs <job_id>
 ```
 
 A multi-step plan is a folder of briefs run sequentially in the same repo:
 
 ```bash
-npx -y zkareemz-skills delegate run --tasks tasks/        # 01-x.md, 02-y.md, …
+npx -y @zkareemz/skills delegate run --tasks tasks/        # 01-x.md, 02-y.md, …
 ```
 
 ### Commands

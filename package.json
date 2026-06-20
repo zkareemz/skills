@@ -1,5 +1,5 @@
 {
-  "name": "zkareemz-skills",
+  "name": "@zkareemz/skills",
   "version": "0.1.0",
   "description": "A collection of agent skills for coding harnesses. Includes pi-delegate: offload implementation work to the pi coding agent.",
   "type": "module",
@@ -27,6 +27,9 @@
     "skills.sh"
   ],
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "yaml": "^2.5.0"
   },

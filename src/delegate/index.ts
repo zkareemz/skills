@@ -16,7 +16,7 @@ import { fail } from "./util.js";
 
 const HELP = `pidelegate — offload implementation work to the pi coding agent.
 
-Usage: zkareemz-skills delegate <command> [options]
+Usage: npx -y @zkareemz/skills delegate <command> [options]
 
 Commands:
   run <brief.md | --tasks <file|dir>>   Start a delegated job (prints job_id)

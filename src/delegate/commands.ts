@@ -111,7 +111,7 @@ export async function cmdRun(argv: string[], entry: string): Promise<void> {
     tasks: briefs.map((b) => b.id),
     cwd,
     parallel: options.parallel,
-    message: `Started. Poll with: zkareemz-skills delegate wait ${id}`,
+    message: `Started. Poll with: npx -y @zkareemz/skills delegate wait ${id}`,
   });
 }
 

@@ -8,7 +8,7 @@ description: >-
   "delegate execution", "let pi build this", or "run this with pidelegate".
 license: MIT
 metadata:
-  engine: "npx -y zkareemz-skills delegate"
+  engine: "npx -y @zkareemz/skills delegate"
 ---
 
 # pi-delegate
@@ -35,7 +35,7 @@ and continue from. The user never leaves your session.
 - `pi` must be installed and authenticated in the environment. The engine runs a
   preflight and returns `{ "ok": false, "error": ... }` if pi is missing/unauthed —
   relay that to the user.
-- The engine is run on demand via `npx -y zkareemz-skills delegate …` (no install).
+- The engine is run on demand via `npx -y @zkareemz/skills delegate …` (no install).
 
 ## Workflow
 
@@ -80,9 +80,9 @@ folder (`tasks/01-x.md`, `tasks/02-y.md`, …) and pass `--tasks tasks/`.
 ### 2. Start the delegation
 
 ```bash
-npx -y zkareemz-skills delegate run .pidelegate-brief.md
+npx -y @zkareemz/skills delegate run .pidelegate-brief.md
 # or a list:
-npx -y zkareemz-skills delegate run --tasks tasks/
+npx -y @zkareemz/skills delegate run --tasks tasks/
 ```
 
 This prints `{"ok":true,"job_id":"<id>", ...}` and returns immediately — pi runs in
@@ -95,7 +95,7 @@ Useful flags: `--model`, `--provider`, `--thinking <off|low|medium|high|xhigh>`,
 ### 3. Wait for completion (poll)
 
 ```bash
-npx -y zkareemz-skills delegate wait <job_id>
+npx -y @zkareemz/skills delegate wait <job_id>
 ```
 
 `wait` blocks up to a safe budget (default 8m) and returns either:
