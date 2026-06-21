@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterEach } from "vitest";
 import { execFileSync, execFile } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -172,6 +172,66 @@ describe("delegate run (integration)", () => {
     // Both branches merged into the real working tree.
     expect(existsSync(join(env.work, "a.txt"))).toBe(true);
     expect(existsSync(join(env.work, "b.txt"))).toBe(true);
+  });
+
+  it("parallel --max-parallel 1: still completes all tasks", () => {
+    const env = makeEnv();
+    gitInit(env.work);
+    const tasksDir = join(env.work, "tasks");
+    mkdirSync(tasksDir);
+    brief(tasksDir, "01-a.md", "a.txt");
+    brief(tasksDir, "02-b.md", "b.txt");
+    const res = run(["run", "--tasks", tasksDir, "--parallel", "--max-parallel", "1", "--wait", "--budget", "30s"], env);
+    expect(res.result.totals).toMatchObject({ tasks: 2, succeeded: 2 });
+  });
+
+  it("read-only: no verify required; runs and returns success without a gate", () => {
+    const env = makeEnv();
+    writeFileSync(
+      join(env.work, "ro.md"),
+      ["## Objective", "Investigate the repo.", "## Acceptance criteria", "Report findings."].join("\n"),
+    );
+    const res = run(["run", "ro.md", "--read-only", "--wait", "--budget", "30s"], env);
+    expect(res.result.overall).toBe("success");
+    expect(res.result.tasks[0].status).toBe("success");
+    expect(res.result.tasks[0].verification.ran).toBe(false);
+  });
+
+  it("file detection: git porcelain catches a change with no tool event", () => {
+    const env = makeEnv({ MOCK_PI_SIDE_FILE: "side.txt" });
+    gitInit(env.work);
+    brief(env.work, "brief.md", "hello.txt");
+    const res = run(["run", "brief.md", "--wait", "--budget", "30s"], env);
+    expect(res.result.overall).toBe("success");
+    const paths = res.result.tasks[0].filesChanged.map((c: any) => c.path);
+    expect(paths).toContain("hello.txt"); // tool event + git
+    expect(paths).toContain("side.txt"); // git only — no tool event existed
+  });
+
+  it("liveness: a dead supervisor is reconciled to error", async () => {
+    const env = makeEnv({ MOCK_PI_SLEEP_MS: "6000" });
+    brief(env.work, "brief.md", "hello.txt");
+    const id = run(["run", "brief.md"], env).job_id;
+
+    let pid: number | null = null;
+    for (let i = 0; i < 60; i++) {
+      const meta = JSON.parse(readFileSync(join(env.home, "jobs", id, "meta.json"), "utf8"));
+      if (meta.supervisorPid && meta.status === "running") {
+        pid = meta.supervisorPid;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(pid).toBeTruthy();
+    process.kill(pid!, "SIGKILL");
+
+    let final: any;
+    for (let i = 0; i < 60; i++) {
+      final = run(["status", id], env);
+      if (final.status === "error") break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(final.status).toBe("error");
   });
 
   it("abort: a running job can be aborted and reports aborted", async () => {

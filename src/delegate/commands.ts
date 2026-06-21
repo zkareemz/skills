@@ -8,22 +8,27 @@ import { loadBriefs, dedupeIds } from "./brief.js";
 import { preflight } from "./pi.js";
 import { runSupervisor } from "./supervisor.js";
 import { readEvents } from "./events.js";
+import { rollup } from "./report.js";
+import { porcelain } from "./gitstatus.js";
 import {
   newJobId,
   readMeta,
   writeMeta,
   writeBriefs,
+  writeResult,
+  readTaskResult,
   ensureJobDirs,
   jobExists,
   listJobIds,
   readResult,
   requestAbort,
   clearAbort,
+  isProcessAlive,
   supervisorLogPath,
   eventsPath,
 } from "./store.js";
 import { parseDuration, printJson, fail, sleep, fmtCost } from "./util.js";
-import type { Brief, JobMeta, JobOptions, JobStatus } from "./types.js";
+import type { Brief, JobMeta, JobOptions, JobStatus, TaskResult } from "./types.js";
 
 const TERMINAL: JobStatus[] = ["done", "aborted", "error"];
 const isTerminal = (s: JobStatus) => TERMINAL.includes(s);
@@ -33,6 +38,31 @@ function progressOf(meta: JobMeta) {
   for (const t of meta.tasks) byStatus[t.status] = (byStatus[t.status] ?? 0) + 1;
   const running = meta.tasks.find((t) => t.status === "running")?.id ?? null;
   return { tasksTotal: meta.tasks.length, running, byStatus, status: meta.status };
+}
+
+/**
+ * Detect a dead supervisor (crashed/killed) and mark the job errored rather than
+ * letting it hang in "running" forever. Returns the (possibly updated) meta.
+ */
+function reconcile(id: string): JobMeta {
+  const meta = readMeta(id);
+  const orphaned =
+    (meta.status === "running" || meta.status === "queued") &&
+    meta.supervisorPid != null &&
+    !isProcessAlive(meta.supervisorPid);
+  if (!orphaned) return meta;
+
+  meta.status = "error";
+  meta.error = meta.error ?? "supervisor process is no longer running (crashed or was killed)";
+  meta.finishedAt = meta.finishedAt ?? new Date().toISOString();
+  writeMeta(meta);
+  if (!readResult(id)) {
+    const tasks = meta.tasks
+      .map((t) => readTaskResult(id, t.id) as TaskResult | null)
+      .filter((r): r is TaskResult => r != null);
+    writeResult(id, rollup(id, meta.cwd, "error", tasks, meta.piVersion));
+  }
+  return meta;
 }
 
 // ---- run -------------------------------------------------------------------
@@ -48,6 +78,8 @@ export async function cmdRun(argv: string[], entry: string): Promise<void> {
       thinking: { type: "string" },
       tools: { type: "string" },
       parallel: { type: "boolean", default: false },
+      "max-parallel": { type: "string" },
+      "read-only": { type: "boolean", default: false },
       "fail-fast": { type: "boolean", default: false },
       timeout: { type: "string" },
       "max-fix": { type: "string" },
@@ -63,20 +95,25 @@ export async function cmdRun(argv: string[], entry: string): Promise<void> {
   const input = values.tasks ?? positionals[0];
   if (!input) fail("provide a brief file (positional) or --tasks <file|dir>");
 
+  const readOnly = values["read-only"] ?? false;
   let briefs: Brief[];
   try {
-    briefs = dedupeIds(loadBriefs(resolve(input)));
+    briefs = dedupeIds(loadBriefs(resolve(input), !readOnly));
   } catch (e) {
     return fail((e as Error).message);
   }
 
   const cwd = resolve(values.cwd ?? process.cwd());
+  // Read-only delegations get pi's non-mutating toolset unless --tools was set.
+  const tools = values.tools ?? (readOnly ? "read,grep,find,ls" : undefined);
   const options: JobOptions = {
     ...(values.model ? { model: values.model } : {}),
     ...(values.provider ? { provider: values.provider } : {}),
     ...(values.thinking ? { thinking: values.thinking } : {}),
-    ...(values.tools ? { tools: values.tools } : {}),
+    ...(tools ? { tools } : {}),
     parallel: values.parallel ?? false,
+    maxParallel: values["max-parallel"] ? Math.max(1, Number(values["max-parallel"])) : 4,
+    readOnly,
     failFast: values["fail-fast"] ?? false,
     timeoutMs: parseDuration(values.timeout, 30 * 60_000),
     maxFixIterations: values["max-fix"] ? Number(values["max-fix"]) : 2,
@@ -92,12 +129,24 @@ export async function cmdRun(argv: string[], entry: string): Promise<void> {
     cwd,
     status: "queued",
     options,
+    piVersion: pf.version ?? null,
     supervisorPid: null,
     tasks: briefs.map((b) => ({ id: b.id, status: "queued", dependsOn: b.dependsOn ?? [] })),
   };
   ensureJobDirs(id, briefs.map((b) => b.id));
   writeBriefs(id, briefs);
   writeMeta(meta);
+
+  // Warn when delegating in-place into a dirty tree (pi's edits will mix with yours).
+  const warnings: string[] = [];
+  if (!options.parallel && !readOnly) {
+    const dirty = porcelain(cwd);
+    if (dirty && dirty.length > 0) {
+      warnings.push(
+        `working tree has ${dirty.length} uncommitted change(s); pi edits in place, so its changes will mix with yours — consider committing or stashing first.`,
+      );
+    }
+  }
 
   spawnSupervisor(id, entry, cwd);
 
@@ -111,6 +160,7 @@ export async function cmdRun(argv: string[], entry: string): Promise<void> {
     tasks: briefs.map((b) => b.id),
     cwd,
     parallel: options.parallel,
+    ...(warnings.length ? { warnings } : {}),
     message: `Started. Poll with: npx -y @zkareemz/skills delegate wait ${id}`,
   });
 }
@@ -141,7 +191,7 @@ export async function cmdWait(argv: string[]): Promise<void> {
 async function waitLoop(id: string, budgetMs: number, intervalMs = 1000): Promise<void> {
   const deadline = Date.now() + budgetMs;
   for (;;) {
-    const meta = readMeta(id);
+    const meta = reconcile(id);
     if (isTerminal(meta.status)) {
       printJson({ ok: true, state: "done", job_id: id, result: readResult(id) ?? null });
       return;
@@ -165,7 +215,7 @@ async function waitLoop(id: string, budgetMs: number, intervalMs = 1000): Promis
 export function cmdStatus(argv: string[]): void {
   const id = argv[0];
   if (!id || !jobExists(id)) fail(`unknown job: ${id ?? "(none)"}`);
-  const meta = readMeta(id!);
+  const meta = reconcile(id!);
   printJson({
     ok: true,
     job_id: id,
@@ -181,6 +231,7 @@ export function cmdStatus(argv: string[]): void {
 export function cmdResult(argv: string[]): void {
   const id = argv[0];
   if (!id || !jobExists(id)) fail(`unknown job: ${id ?? "(none)"}`);
+  reconcile(id!);
   const result = readResult(id!);
   if (!result) fail(`no result yet for job ${id} (still running?)`);
   printJson({ ok: true, result });

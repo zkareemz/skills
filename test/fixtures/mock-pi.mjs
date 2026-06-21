@@ -58,6 +58,10 @@ if (shouldCreate) {
     result: { content: [{ type: "text", text: `wrote ${file}` }] },
     isError: false,
   });
+  // A change made WITHOUT a tool event (simulates a bash-driven edit) — only
+  // git porcelain can see this, not the event stream.
+  const sideFile = process.env.MOCK_PI_SIDE_FILE;
+  if (sideFile) writeFileSync(join(cwd, sideFile), "side");
 }
 
 const report =

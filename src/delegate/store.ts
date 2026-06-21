@@ -141,6 +141,17 @@ export function listJobIds(): string[] {
     .sort((a, b) => mtime(metaPath(b)) - mtime(metaPath(a)));
 }
 
+/** Is a process with this pid currently alive? (signal 0 = existence probe.) */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    // ESRCH = no such process; EPERM = exists but not ours (still alive).
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 export function requestAbort(id: string): void {
   writeFileSync(abortFlagPath(id), new Date().toISOString());
 }

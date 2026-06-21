@@ -64,7 +64,12 @@ npx -y @zkareemz/skills delegate run --tasks tasks/        # 01-x.md, 02-y.md, �
 | `list` | Recent jobs |
 
 Run flags: `--model --provider --thinking --tools --timeout 30m --max-fix 2
---fail-fast --parallel --cwd <dir>`.
+--fail-fast --read-only --parallel [--max-parallel N] --cwd <dir>`.
+
+The engine ships **bundled inside the skill** (`skills/pi-delegate/scripts/pidelegate.cjs`),
+so a host can run it with zero install: `node "<skill-dir>/scripts/pidelegate.cjs"
+delegate …`. The `npx -y @zkareemz/skills …` path above is the published-package
+alternative.
 
 ### How it works
 
@@ -72,8 +77,11 @@ Run flags: `--model --provider --thinking --tools --timeout 30m --max-fix 2
 - After pi stops, the engine runs your **`verify` commands** as the success gate.
 - On a red verify it resumes pi's session to fix it, up to `--max-fix` times, then
   reports `partial`.
-- Results combine mechanical facts (files changed, cost, verify results) with pi's
-  end-of-run self-report. Jobs live under `~/.pidelegate/jobs/<id>/`.
+- `filesChanged` comes from `git status` (catches anything on disk, incl. bash
+  edits/deletes/renames) unioned with pi's tool events; combined with cost and pi's
+  cross-checked self-report. Jobs live under `~/.pidelegate/jobs/<id>/`.
+- A dead supervisor is reconciled to `error` on the next `status`/`wait` (no zombie
+  jobs); `--read-only` delegates with pi's non-mutating tools and an optional gate.
 - Default execution is **sequential, in-place** (no isolation; your git is your
   safety net). `--parallel` runs each delegate in its own git worktree and merges.
 

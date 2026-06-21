@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { parseBrief, validateBrief, BriefError, renderPrompt, SENTINEL } from "../src/delegate/brief.js";
-import { parseEventLines, extract } from "../src/delegate/events.js";
+import { parseEventLines, extract, type Extracted } from "../src/delegate/events.js";
 import { parseSelfReport, buildTaskResult, rollup } from "../src/delegate/report.js";
+import { porcelainDelta } from "../src/delegate/gitstatus.js";
 import { runVerify, failingTail } from "../src/delegate/verify.js";
 import { parseDuration } from "../src/delegate/util.js";
 import type { Brief } from "../src/delegate/types.js";
@@ -79,7 +80,7 @@ describe("event extraction", () => {
 
   it("extracts files changed, ignoring failed tool calls", () => {
     const ex = extract(parseEventLines(stream));
-    expect(ex.filesChanged).toEqual([{ path: "a.ts", kind: "create" }]); // b.ts failed
+    expect(ex.toolFilesChanged).toEqual([{ path: "a.ts", kind: "create" }]); // b.ts failed
     expect(ex.completed).toBe(true);
     expect(ex.finalText).toBe("done");
   });
@@ -87,6 +88,36 @@ describe("event extraction", () => {
   it("tolerates partial trailing lines", () => {
     const ex = extract(parseEventLines(stream + "\n{partial"));
     expect(ex.completed).toBe(true);
+  });
+
+  it("dedupes cost by responseId (no double-count on replay)", () => {
+    const msg = (rid: string) =>
+      JSON.stringify({
+        type: "message_end",
+        message: { role: "assistant", responseId: rid, provider: "p", model: "m", content: [{ type: "text", text: "x" }], usage: { cost: { total: 0.1 } } },
+      });
+    // Same responseId appears twice (e.g. a fix-loop resume replaying the turn).
+    const ex = extract(parseEventLines([msg("r1"), msg("r1"), msg("r2")].join("\n")));
+    expect(ex.cost.total).toBeCloseTo(0.2);
+    expect(ex.provider).toBe("p");
+    expect(ex.model).toBe("m");
+  });
+});
+
+describe("git porcelain delta", () => {
+  it("classifies create/modify/delete/rename and excludes pre-existing", () => {
+    const before = [" M keep.ts"]; // already dirty before the run
+    const after = [" M keep.ts", "?? new.ts", " M edited.ts", " D gone.ts", 'R  "a.ts" -> "b.ts"'];
+    const delta = porcelainDelta(before, after)!;
+    expect(delta).toEqual([
+      { path: "new.ts", kind: "create" },
+      { path: "edited.ts", kind: "modify" },
+      { path: "gone.ts", kind: "delete" },
+      { path: "b.ts", kind: "rename" },
+    ]);
+  });
+  it("returns null when git can't report after the run", () => {
+    expect(porcelainDelta([], null)).toBeNull();
   });
 });
 
@@ -126,35 +157,65 @@ describe("verify gate", () => {
 
 describe("result + rollup", () => {
   const brief: Brief = { id: "t", objective: "O", acceptance: "A", verify: ["true"], dependsOn: [] };
+  const zc = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+  const ext = (p: Partial<Extracted> = {}): Extracted => ({
+    finalText: "",
+    toolFilesChanged: [],
+    cost: zc,
+    hadError: false,
+    completed: true,
+    ...p,
+  });
+
   it("marks success when verify passed", () => {
     const r = buildTaskResult({
       jobId: "j",
       brief,
-      extracted: { finalText: "ok", filesChanged: [{ path: "x", kind: "create" }], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, hadError: false, completed: true },
+      extracted: ext({ finalText: "ok" }),
+      filesChanged: [{ path: "x", kind: "create" }],
       verify: { passed: true, ran: true, results: [] },
       fixIterations: 0,
       aborted: false,
     });
     expect(r.status).toBe("success");
     expect(r.acceptance.met).toBe(true);
+    expect(r.filesChanged).toEqual([{ path: "x", kind: "create" }]);
   });
+
   it("marks partial when verify failed but work was done", () => {
     const r = buildTaskResult({
       jobId: "j",
       brief,
-      extracted: { finalText: "", filesChanged: [{ path: "x", kind: "create" }], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, hadError: false, completed: true },
+      extracted: ext(),
+      filesChanged: [{ path: "x", kind: "create" }],
       verify: { passed: false, ran: true, results: [] },
       fixIterations: 2,
       aborted: false,
     });
     expect(r.status).toBe("partial");
   });
-  it("rolls up mixed task statuses to partial", () => {
-    const ok = buildTaskResult({ jobId: "j", brief, extracted: { finalText: "", filesChanged: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.5 }, hadError: false, completed: true }, verify: { passed: true, ran: true, results: [] }, fixIterations: 0, aborted: false });
-    const bad = buildTaskResult({ jobId: "j", brief: { ...brief, id: "u" }, extracted: { finalText: "", filesChanged: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, hadError: false, completed: false }, verify: { passed: false, ran: true, results: [] }, fixIterations: 2, aborted: false });
-    const r = rollup("j", "/x", "done", [ok, bad]);
+
+  it("read-only (no verify gate): success on completion", () => {
+    const r = buildTaskResult({
+      jobId: "j",
+      brief: { ...brief, verify: [] },
+      extracted: ext({ finalText: "findings" }),
+      filesChanged: [],
+      verify: { passed: false, ran: false, results: [] },
+      fixIterations: 0,
+      aborted: false,
+    });
+    expect(r.status).toBe("success");
+    expect(r.acceptance.met).toBeNull();
+  });
+
+  it("rolls up mixed task statuses to partial, includes engine + cost", () => {
+    const ok = buildTaskResult({ jobId: "j", brief, extracted: ext({ cost: { ...zc, total: 0.5 } }), filesChanged: [], verify: { passed: true, ran: true, results: [] }, fixIterations: 0, aborted: false });
+    const bad = buildTaskResult({ jobId: "j", brief: { ...brief, id: "u" }, extracted: ext({ completed: false }), filesChanged: [], verify: { passed: false, ran: true, results: [] }, fixIterations: 2, aborted: false });
+    const r = rollup("j", "/x", "done", [ok, bad], "0.79.8");
     expect(r.overall).toBe("partial");
     expect(r.totals.cost).toBeCloseTo(0.5);
+    expect(r.engine.piVersion).toBe("0.79.8");
   });
 });
 

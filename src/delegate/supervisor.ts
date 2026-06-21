@@ -7,6 +7,7 @@ import { runPi } from "./pi.js";
 import { runVerify, failingTail } from "./verify.js";
 import { readEvents, extract } from "./events.js";
 import { buildTaskResult, rollup } from "./report.js";
+import { porcelain, porcelainDelta, mergeChanges } from "./gitstatus.js";
 import {
   isGitRepo,
   createWorktree,
@@ -29,7 +30,7 @@ import {
   abortRequested,
   ensureJobDirs,
 } from "./store.js";
-import type { Brief, JobMeta, TaskResult, TaskStatus } from "./types.js";
+import type { Brief, JobMeta, TaskResult, TaskStatus, VerifyResult } from "./types.js";
 
 function log(...args: unknown[]): void {
   console.log(`[${new Date().toISOString()}]`, ...args);
@@ -45,11 +46,13 @@ async function runTask(
   const jobId = meta.id;
   const events = eventsPath(jobId, brief.id);
   const opts = meta.options;
+  const hasVerify = brief.verify.length > 0;
+  const before = porcelain(execCwd);
 
-  log(`task ${brief.id}: starting (verify: ${brief.verify.join(", ")})`);
+  log(`task ${brief.id}: starting (${hasVerify ? `verify: ${brief.verify.join(", ")}` : "no verify gate"})`);
   await runPi({
     cwd: execCwd,
-    prompt: renderPrompt(brief),
+    prompt: renderPrompt(brief, { readOnly: opts.readOnly }),
     sessionDir: sessionsDir(jobId),
     sessionId: brief.id,
     eventsFile: events,
@@ -58,10 +61,12 @@ async function runTask(
   });
 
   let fixIterations = 0;
-  let verify = await runVerify(execCwd, brief.verify, controller.signal);
-  log(`task ${brief.id}: verify ${verify.passed ? "passed" : "FAILED"}`);
+  let verify: VerifyResult = hasVerify
+    ? await runVerify(execCwd, brief.verify, controller.signal)
+    : { passed: false, ran: false, results: [] };
+  if (hasVerify) log(`task ${brief.id}: verify ${verify.passed ? "passed" : "FAILED"}`);
 
-  while (!verify.passed && fixIterations < opts.maxFixIterations && !controller.signal.aborted) {
+  while (hasVerify && !verify.passed && fixIterations < opts.maxFixIterations && !controller.signal.aborted) {
     fixIterations += 1;
     log(`task ${brief.id}: fix iteration ${fixIterations}/${opts.maxFixIterations}`);
     await runPi({
@@ -77,10 +82,13 @@ async function runTask(
     log(`task ${brief.id}: verify ${verify.passed ? "passed" : "still failing"}`);
   }
 
+  const extracted = extract(readEvents(events));
+  const filesChanged = mergeChanges(porcelainDelta(before, porcelain(execCwd)), extracted.toolFilesChanged);
   const result = buildTaskResult({
     jobId,
     brief,
-    extracted: extract(readEvents(events)),
+    extracted,
+    filesChanged,
     verify,
     fixIterations,
     aborted: controller.signal.aborted,
@@ -164,34 +172,53 @@ async function runParallel(
   if (!isGitRepo(meta.cwd)) {
     throw new Error("--parallel requires the working directory to be a git repository");
   }
-  log(`parallel: ${briefs.length} delegates, one git worktree each`);
+  const limit = Math.max(1, meta.options.maxParallel);
+  log(`parallel: ${briefs.length} delegates, up to ${limit} at once, one git worktree each`);
   for (const b of briefs) setTaskStatus(meta, b.id, "running");
   writeMeta(meta);
 
-  const worktrees = new Map<string, Worktree>();
-  for (const b of briefs) worktrees.set(b.id, createWorktree(meta.cwd, meta.id, b.id));
+  interface Outcome {
+    brief: Brief;
+    result: TaskResult;
+    committed: boolean;
+    wt: Worktree | null;
+  }
+  const outcomes: Outcome[] = [];
+  const queue = [...briefs];
 
-  const settled = await Promise.allSettled(
-    briefs.map(async (b) => {
-      const wt = worktrees.get(b.id)!;
-      const result = await executeTask(meta, b, controller, wt.dir);
-      const committed =
-        !controller.signal.aborted &&
-        result.status !== "aborted" &&
-        commitAll(wt.dir, `pidelegate: ${b.id}`);
-      return { brief: b, result, committed, wt };
-    }),
-  );
-
-  // Merge successful, committed branches back into the repo, one at a time.
-  for (const s of settled) {
-    if (s.status !== "fulfilled") {
-      log(`parallel: a delegate rejected: ${String(s.reason)}`);
-      continue;
+  // Worker pool: each worker pulls the next brief and runs it in its own worktree.
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const b = queue.shift();
+      if (!b) return;
+      let wt: Worktree | null = null;
+      try {
+        wt = createWorktree(meta.cwd, meta.id, b.id);
+        const result = await executeTask(meta, b, controller, wt.dir);
+        const committed =
+          !controller.signal.aborted &&
+          result.status !== "aborted" &&
+          commitAll(wt.dir, `pidelegate: ${b.id}`);
+        outcomes.push({ brief: b, result, committed, wt });
+      } catch (err) {
+        log(`parallel: ${b.id} setup/run error ${(err as Error).message}`);
+        outcomes.push({
+          brief: b,
+          result: { ...abortedResult(meta.id, b), status: "failed", summary: `Delegate errored: ${(err as Error).message}` },
+          committed: false,
+          wt,
+        });
+      }
     }
-    const { brief, result, committed, wt } = s.value;
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, briefs.length) }, worker));
+
+  // Merge successful, committed branches back into the repo, one at a time, in
+  // original brief order for a deterministic history.
+  outcomes.sort((a, b) => briefs.indexOf(a.brief) - briefs.indexOf(b.brief));
+  for (const { brief, result, committed, wt } of outcomes) {
     let finalResult = result;
-    if (result.status === "success" && committed) {
+    if (result.status === "success" && committed && wt) {
       const merge = mergeBranch(meta.cwd, wt.branch);
       if (merge.conflict) {
         finalResult = {
@@ -207,9 +234,8 @@ async function runParallel(
     writeTaskResult(meta.id, brief.id, finalResult);
     setTaskStatus(meta, brief.id, finalResult.status);
     results.push(finalResult);
+    if (wt) removeWorktree(meta.cwd, wt);
   }
-
-  for (const wt of worktrees.values()) removeWorktree(meta.cwd, wt);
   writeMeta(meta);
 }
 
@@ -261,14 +287,14 @@ export async function runSupervisor(jobId: string): Promise<void> {
     meta.finishedAt = new Date().toISOString();
     if (abortedReason) meta.error = abortedReason;
     writeMeta(meta);
-    writeResult(jobId, rollup(jobId, meta.cwd, jobStatus, results));
+    writeResult(jobId, rollup(jobId, meta.cwd, jobStatus, results, meta.piVersion));
     log(`job ${jobId}: ${jobStatus} (${results.length} tasks)`);
   } catch (err) {
     meta.status = "error";
     meta.error = (err as Error).message;
     meta.finishedAt = new Date().toISOString();
     writeMeta(meta);
-    writeResult(jobId, rollup(jobId, meta.cwd, "error", results));
+    writeResult(jobId, rollup(jobId, meta.cwd, "error", results, meta.piVersion));
     log(`job ${jobId}: error ${(err as Error).message}`);
   } finally {
     clearInterval(poller);

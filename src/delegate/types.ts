@@ -37,7 +37,11 @@ export interface JobOptions {
   thinking?: string;
   tools?: string;
   parallel: boolean;
+  /** Max concurrent delegates when parallel (worktree pool size). */
+  maxParallel: number;
   failFast: boolean;
+  /** Read-only delegation: pi gets read tools only and verify is optional. */
+  readOnly: boolean;
   /** Whole-job wall-clock budget in milliseconds. */
   timeoutMs: number;
   /** Max fix-loop iterations after a red verify. */
@@ -54,8 +58,7 @@ export interface PiCost {
 
 export interface FileChange {
   path: string;
-  /** "create" for write of a new path, "modify" for edits / overwrites. */
-  kind: "create" | "modify";
+  kind: "create" | "modify" | "delete" | "rename";
 }
 
 export interface VerifyCommandResult {
@@ -81,6 +84,8 @@ export interface TaskResult {
   blockers: string[];
   fixIterations: number;
   cost: PiCost;
+  provider?: string;
+  model?: string;
   pointers: {
     jobId: string;
     eventsPath: string;
@@ -95,6 +100,7 @@ export interface JobRollup {
   status: JobStatus;
   overall: "success" | "partial" | "failed";
   cwd: string;
+  engine: { piVersion: string | null };
   tasks: TaskResult[];
   totals: {
     tasks: number;
@@ -119,6 +125,7 @@ export interface JobMeta {
   cwd: string;
   status: JobStatus;
   options: JobOptions;
+  piVersion: string | null;
   supervisorPid: number | null;
   tasks: TaskMeta[];
   /** Set when the job reaches a terminal state. */

@@ -1,0 +1,10 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "groupings": [
+    {
+      "title": "Delegate to coding agents",
+      "description": "Delegate implementation work to a CLI coding agent, then review the verified result and continue. pi-delegate offloads execution to the pi coding agent.",
+      "skills": ["pi-delegate"]
+    }
+  ]
+}

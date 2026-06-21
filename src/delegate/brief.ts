@@ -102,7 +102,7 @@ function asStringArray(value: unknown, field: string): string[] {
 }
 
 /** Parse a single brief from markdown text. `fallbackId` used when none given. */
-export function parseBrief(raw: string, fallbackId: string): Brief {
+export function parseBrief(raw: string, fallbackId: string, requireVerify = true): Brief {
   const { fm, body } = splitFrontmatter(raw);
   const sections = parseSections(body);
 
@@ -116,16 +116,16 @@ export function parseBrief(raw: string, fallbackId: string): Brief {
   const dependsOn = asStringArray(fm.depends_on ?? fm.dependsOn, "depends_on");
   const id = (typeof fm.id === "string" && fm.id.trim()) || fallbackId;
 
-  return validateBrief({ ...brief, id, verify, dependsOn });
+  return validateBrief({ ...brief, id, verify, dependsOn }, requireVerify);
 }
 
 /** Validate a (possibly object-sourced) brief, throwing BriefError on problems. */
-export function validateBrief(input: Partial<Brief>): Brief {
+export function validateBrief(input: Partial<Brief>, requireVerify = true): Brief {
   const missing: string[] = [];
   if (!input.objective?.trim()) missing.push("objective (## Objective)");
   if (!input.acceptance?.trim()) missing.push("acceptance criteria (## Acceptance criteria)");
   const verify = input.verify ?? [];
-  if (verify.length === 0) missing.push("verify (frontmatter `verify:` with >=1 command)");
+  if (requireVerify && verify.length === 0) missing.push("verify (frontmatter `verify:` with >=1 command)");
   if (missing.length) {
     throw new BriefError(
       `brief "${input.id ?? "?"}" is missing required fields: ${missing.join(", ")}`,
@@ -144,8 +144,9 @@ export function validateBrief(input: Partial<Brief>): Brief {
   };
 }
 
-function fromObject(obj: Record<string, unknown>, fallbackId: string): Brief {
-  return validateBrief({
+function fromObject(obj: Record<string, unknown>, fallbackId: string, requireVerify = true): Brief {
+  return validateBrief(
+    {
     id: typeof obj.id === "string" ? obj.id : fallbackId,
     objective: typeof obj.objective === "string" ? obj.objective : undefined,
     acceptance:
@@ -165,11 +166,13 @@ function fromObject(obj: Record<string, unknown>, fallbackId: string): Brief {
         : typeof obj.outOfScope === "string"
           ? (obj.outOfScope as string)
           : undefined,
-  });
+    },
+    requireVerify,
+  );
 }
 
 /** Load one-or-many briefs from a path (file or directory). */
-export function loadBriefs(inputPath: string): Brief[] {
+export function loadBriefs(inputPath: string, requireVerify = true): Brief[] {
   if (!existsSync(inputPath)) throw new BriefError(`input not found: ${inputPath}`);
   const st = statSync(inputPath);
 
@@ -179,7 +182,11 @@ export function loadBriefs(inputPath: string): Brief[] {
       .sort();
     if (files.length === 0) throw new BriefError(`no .md briefs in directory: ${inputPath}`);
     return files.map((f, i) =>
-      parseBrief(readFileSync(join(inputPath, f), "utf8"), slug(basename(f, ".md")) || `task-${i + 1}`),
+      parseBrief(
+        readFileSync(join(inputPath, f), "utf8"),
+        slug(basename(f, ".md")) || `task-${i + 1}`,
+        requireVerify,
+      ),
     );
   }
 
@@ -190,17 +197,17 @@ export function loadBriefs(inputPath: string): Brief[] {
     const data = ext === ".json" ? JSON.parse(raw) : parseYaml(raw);
     const arr = Array.isArray(data) ? data : Array.isArray((data as { tasks?: unknown }).tasks) ? (data as { tasks: unknown[] }).tasks : null;
     if (!arr) throw new BriefError(`expected a top-level array (or { tasks: [...] }) in ${inputPath}`);
-    return arr.map((o, i) => fromObject(o as Record<string, unknown>, `task-${i + 1}`));
+    return arr.map((o, i) => fromObject(o as Record<string, unknown>, `task-${i + 1}`, requireVerify));
   }
 
   // Single markdown file, possibly several briefs separated by a line of `===`.
   const chunks = raw.replace(/\r\n/g, "\n").split(/\n={3,}\s*\n/);
   if (chunks.length === 1) {
-    return [parseBrief(raw, slug(basename(inputPath, ".md")) || "task-1")];
+    return [parseBrief(raw, slug(basename(inputPath, ".md")) || "task-1", requireVerify)];
   }
   return chunks
     .filter((c) => c.trim())
-    .map((c, i) => parseBrief(c, `task-${i + 1}`));
+    .map((c, i) => parseBrief(c, `task-${i + 1}`, requireVerify));
 }
 
 /** Ensure task ids are unique (suffix duplicates) so job dirs don't collide. */
@@ -216,13 +223,17 @@ export function dedupeIds(briefs: Brief[]): Brief[] {
 const SENTINEL = "pidelegate-report";
 
 /** Render a brief into the prompt text handed to a fresh pi session. */
-export function renderPrompt(brief: Brief): string {
+export function renderPrompt(brief: Brief, opts: { readOnly?: boolean } = {}): string {
   const parts: string[] = [];
   parts.push(
-    "You are an autonomous implementation agent invoked by `pidelegate`. " +
-      "Implement the task below completely, editing files in the current repository. " +
-      "You have no prior conversation context — everything you need is in this brief. " +
-      "Work until the acceptance criteria are met; run relevant checks yourself as you go.",
+    opts.readOnly
+      ? "You are an autonomous investigation agent invoked by `pidelegate`. " +
+          "Do NOT modify, create, or delete any files — read, search, and analyze only, then report findings. " +
+          "You have no prior conversation context — everything you need is in this brief."
+      : "You are an autonomous implementation agent invoked by `pidelegate`. " +
+          "Implement the task below completely, editing files in the current repository. " +
+          "You have no prior conversation context — everything you need is in this brief. " +
+          "Work until the acceptance criteria are met; run relevant checks yourself as you go.",
   );
   parts.push(`\n## Objective\n${brief.objective}`);
   parts.push(`\n## Acceptance criteria\n${brief.acceptance}`);
@@ -230,10 +241,12 @@ export function renderPrompt(brief: Brief): string {
   if (brief.paths) parts.push(`\n## Relevant paths\n${brief.paths}`);
   if (brief.constraints) parts.push(`\n## Constraints\n${brief.constraints}`);
   if (brief.outOfScope) parts.push(`\n## Out of scope\n${brief.outOfScope}`);
-  parts.push(
-    `\n## Verification\nThese commands will be run to check your work; make them pass:\n` +
-      brief.verify.map((c) => `- \`${c}\``).join("\n"),
-  );
+  if (brief.verify.length > 0) {
+    parts.push(
+      `\n## Verification\nThese commands will be run to check your work; make them pass:\n` +
+        brief.verify.map((c) => `- \`${c}\``).join("\n"),
+    );
+  }
   parts.push(
     `\n## Final report (required)\n` +
       `When you are done, output as your final message a fenced code block tagged \`${SENTINEL}\` ` +

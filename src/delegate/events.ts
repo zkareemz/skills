@@ -52,8 +52,11 @@ export function readEvents(path: string): PiEvent[] {
 
 export interface Extracted {
   finalText: string;
-  filesChanged: FileChange[];
+  /** From parsed write/edit tool events; the engine prefers git porcelain when available. */
+  toolFilesChanged: FileChange[];
   cost: PiCost;
+  provider?: string;
+  model?: string;
   hadError: boolean;
   /** True if at least one agent_end was seen (the run reached completion). */
   completed: boolean;
@@ -79,31 +82,44 @@ export function extract(events: PiEvent[]): Extracted {
   }
 
   const cost = { ...ZERO_COST };
+  const seenResponses = new Set<string>();
   let finalText = "";
+  let provider: string | undefined;
+  let model: string | undefined;
   let completed = false;
   let hadError = false;
 
-  for (const e of events) {
-    if (e.type === "message_end" && e.message?.role === "assistant") {
-      addCost(cost, e.message.usage?.cost);
-      const text = textOf(e.message);
-      if (text) finalText = text;
+  // Count each assistant response's cost once (dedupe by responseId) so fix-loop
+  // resumes that replay earlier turns don't inflate the total.
+  const consider = (msg: any): void => {
+    if (!msg || msg.role !== "assistant") return;
+    const text = textOf(msg);
+    if (text) finalText = text; // last assistant text wins
+    if (msg.provider) provider = msg.provider;
+    if (msg.model) model = msg.model;
+    const rid: unknown = msg.responseId;
+    if (typeof rid === "string") {
+      if (seenResponses.has(rid)) return;
+      seenResponses.add(rid);
     }
+    addCost(cost, msg.usage?.cost);
+  };
+
+  for (const e of events) {
+    if (e.type === "message_end") consider(e.message);
     if (e.type === "agent_end") {
       completed = true;
-      if (Array.isArray(e.messages)) {
-        const lastAssistant = [...e.messages].reverse().find((m) => m?.role === "assistant");
-        const text = lastAssistant ? textOf(lastAssistant) : "";
-        if (text) finalText = text;
-      }
+      if (Array.isArray(e.messages)) for (const m of e.messages) consider(m);
     }
     if (e.type === "extension_error" || e.type === "error") hadError = true;
   }
 
   return {
     finalText: finalText.trim(),
-    filesChanged: [...changes.entries()].map(([path, kind]) => ({ path, kind })),
+    toolFilesChanged: [...changes.entries()].map(([path, kind]) => ({ path, kind })),
     cost,
+    ...(provider ? { provider } : {}),
+    ...(model ? { model } : {}),
     hadError,
     completed,
   };
